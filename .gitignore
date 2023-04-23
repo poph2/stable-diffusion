@@ -3,3 +3,4 @@ outputs
 /latent_diffusion.egg-info/
 __pycache__
 *.ckpt
+.DS_Store
