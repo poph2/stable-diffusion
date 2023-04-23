@@ -1,0 +1,16 @@
+{
+  "name": "stable-diffusion",
+  "version": "1.0.0",
+  "description": "*Stable Diffusion was made possible thanks to a collaboration with [Stability AI](https://stability.ai/) and [Runway](https://runwayml.com/) and builds upon our previous work:*",
+  "main": "index.js",
+  "scripts": {
+    "check-gpu": "python -m torch.utils.collect_env",
+    "build:base": "docker build -t stable-diffusion-base -f dockerfiles/base.dockerfile .",
+    "build:stable-diffusion": "docker build -t stable-diffusion -f dockerfiles/sd.dockerfile .",
+    "shell:base": "docker run -i -t stable-diffusion-base /bin/bash",
+    "shell:stable-diffusion": "docker run -i -t stable-diffusion /bin/bash"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
