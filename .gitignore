@@ -1,0 +1,5 @@
+outputs
+.idea
+/latent_diffusion.egg-info/
+__pycache__
+*.ckpt
