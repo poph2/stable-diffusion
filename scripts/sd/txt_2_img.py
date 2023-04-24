@@ -1,13 +1,11 @@
 import argparse, os, sys, glob
-from typing import List
-
 import cv2
 import torch
 import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm, trange
-# from imwatermark import WatermarkEncoder
+from imwatermark import WatermarkEncoder
 from itertools import islice
 from einops import rearrange
 from torchvision.utils import make_grid
@@ -69,19 +67,19 @@ def load_model_from_config(config, ckpt, verbose=False):
     return model
 
 
-# def put_watermark(img, wm_encoder=None):
-#     if wm_encoder is not None:
-#         img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-#         img = wm_encoder.encode(img, 'dwtDct')
-#         img = Image.fromarray(img[:, :, ::-1])
-#     return img
+def put_watermark(img, wm_encoder=None):
+    if wm_encoder is not None:
+        img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        img = wm_encoder.encode(img, 'dwtDct')
+        img = Image.fromarray(img[:, :, ::-1])
+    return img
 
 
 def load_replacement(x):
     try:
         hwc = x.shape
         y = Image.open("assets/rick.jpeg").convert("RGB").resize((hwc[1], hwc[0]))
-        y = (np.array(y)/255.0).astype(x.dtype)
+        y = (np.array(y) / 255.0).astype(x.dtype)
         assert y.shape == x.shape
         return y
     except Exception:
@@ -100,13 +98,10 @@ def check_safety(x_image):
 
 class Text2Image:
 
-    def __init__(self, opt) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.opt = opt
 
-        self.load_model()
-
-    def load_model(self):
+        self.opt = get_opt()
 
         seed_everything(self.opt.seed)
 
@@ -116,14 +111,14 @@ class Text2Image:
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.model = self.model.to(self.device)
 
+    def main(self):
+
         if self.opt.dpm_solver:
             self.sampler = DPMSolverSampler(self.model)
         elif self.opt.plms:
             self.sampler = PLMSSampler(self.model)
         else:
             self.sampler = DDIMSampler(self.model)
-
-    def main(self):
 
         os.makedirs(self.opt.outdir, exist_ok=True)
         outpath = self.opt.outdir
@@ -155,7 +150,7 @@ class Text2Image:
         if self.opt.fixed_code:
             start_code = torch.randn([self.opt.n_samples, self.opt.C, self.opt.H // self.opt.f, self.opt.W // self.opt.f], device=self.device)
 
-        precision_scope = autocast if self.opt.precision=="autocast" else nullcontext
+        precision_scope = autocast if self.opt.precision == "autocast" else nullcontext
         with torch.no_grad():
             with precision_scope("cuda"):
                 with self.model.ema_scope():
@@ -163,9 +158,54 @@ class Text2Image:
                     all_samples = list()
                     for n in trange(self.opt.n_iter, desc="Sampling"):
                         for prompts in tqdm(data, desc="data"):
-                            all_samples.extend(self.generate_image(batch_size=batch_size, prompts=prompts, start_code=start_code, sample_path=sample_path, base_count=base_count))
+                            uc = None
+                            if self.opt.scale != 1.0:
+                                uc = self.model.get_learned_conditioning(batch_size * [""])
+                            if isinstance(prompts, tuple):
+                                prompts = list(prompts)
+                            c = self.model.get_learned_conditioning(prompts)
+                            shape = [self.opt.C, self.opt.H // self.opt.f, self.opt.W // self.opt.f]
+                            samples_ddim, _ = self.sampler.sample(S=self.opt.ddim_steps,
+                                                             conditioning=c,
+                                                             batch_size=self.opt.n_samples,
+                                                             shape=shape,
+                                                             verbose=False,
+                                                             unconditional_guidance_scale=self.opt.scale,
+                                                             unconditional_conditioning=uc,
+                                                             eta=self.opt.ddim_eta,
+                                                             x_T=start_code)
 
-                    self.save_grid(all_samples=all_samples, n_rows=n_rows, outpath=outpath, grid_count=grid_count)
+                            x_samples_ddim = self.model.decode_first_stage(samples_ddim)
+                            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                            x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+
+                            x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+
+                            x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+
+                            if not self.opt.skip_save:
+                                for x_sample in x_checked_image_torch:
+                                    x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                                    img = Image.fromarray(x_sample.astype(np.uint8))
+                                    # img = put_watermark(img, wm_encoder)
+                                    img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                                    base_count += 1
+
+                            if not self.opt.skip_grid:
+                                all_samples.append(x_checked_image_torch)
+
+                    if not self.opt.skip_grid:
+                        # additionally, save as grid
+                        grid = torch.stack(all_samples, 0)
+                        grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+                        grid = make_grid(grid, nrow=n_rows)
+
+                        # to image
+                        grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+                        img = Image.fromarray(grid.astype(np.uint8))
+                        # img = put_watermark(img, wm_encoder)
+                        img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+                        grid_count += 1
 
                     toc = time.time()
 
@@ -173,64 +213,8 @@ class Text2Image:
               f" \nEnjoy.")
 
 
-    def generate_image(self, batch_size: int, prompts: List[str], start_code, sample_path, base_count):
-        all_samples = list()
-        uc = None
-        if self.opt.scale != 1.0:
-            uc = self.model.get_learned_conditioning(batch_size * [""])
-        if isinstance(prompts, tuple):
-            prompts = list(prompts)
-        c = self.model.get_learned_conditioning(prompts)
-        shape = [self.opt.C, self.opt.H // self.opt.f, self.opt.W // self.opt.f]
-        samples_ddim, _ = self.sampler.sample(S=self.opt.ddim_steps,
-                                              conditioning=c,
-                                              batch_size=self.opt.n_samples,
-                                              shape=shape,
-                                              verbose=False,
-                                              unconditional_guidance_scale=self.opt.scale,
-                                              unconditional_conditioning=uc,
-                                              eta=self.opt.ddim_eta,
-                                              x_T=start_code)
-
-        x_samples_ddim = self.model.decode_first_stage(samples_ddim)
-        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-        x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
-
-        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
-
-        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
-
-        if not self.opt.skip_save:
-            for i, x_sample in enumerate(x_checked_image_torch):
-                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                img = Image.fromarray(x_sample.astype(np.uint8))
-                # img = put_watermark(img, wm_encoder)
-                img.save(os.path.join(sample_path, f"{base_count:05}_{i:03}.png"))
-                base_count += 1
-
-        if not self.opt.skip_grid:
-            all_samples.append(x_checked_image_torch)
-
-        return all_samples
-
-    def save_grid(self, all_samples, n_rows, outpath, grid_count):
-        if not self.opt.skip_grid:
-            # additionally, save as grid
-            grid = torch.stack(all_samples, 0)
-            grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-            grid = make_grid(grid, nrow=n_rows)
-
-            # to image
-            grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-            img = Image.fromarray(grid.astype(np.uint8))
-            # img = put_watermark(img, wm_encoder)
-            img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-            grid_count += 1
-
-
-
 if __name__ == "__main__":
-    opt = get_opt()
+    text2Image = Text2Image()
 
-    text2image = Text2Image(opt)
-    text2image.main()
+# python scripts/txt2img.py --prompt "greg manchess portrait painting of armored bobba fett as overwatch character, medium shot, asymmetrical, profile picture, organic painting, sunny day, matte painting, bold shapes, hard edges, street art, trending on artstation, by huang guangjian and gil elvgren and sachin teng" --plms --ckpt sd-v1-4.ckpt --skip_grid --n_samples 1
+# python scripts/sd/txt_2_img.py --prompt "greg manchess portrait painting of armored bobba fett as overwatch character, medium shot, asymmetrical, profile picture, organic painting, sunny day, matte painting, bold shapes, hard edges, street art, trending on artstation, by huang guangjian and gil elvgren and sachin teng" --plms --ckpt sd-v1-4.ckpt --skip_grid --n_samples 1
