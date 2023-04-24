@@ -1,4 +1,6 @@
 import argparse, os, sys, glob
+import uuid
+
 import cv2
 import torch
 import numpy as np
@@ -23,6 +25,7 @@ from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionS
 from transformers import AutoFeatureExtractor
 
 from scripts.sd.args import get_opt
+from scripts.sd.opt import ModelOpt, Text2ImageRequest
 
 # load safety model
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
@@ -98,10 +101,10 @@ def check_safety(x_image):
 
 class Text2Image:
 
-    def __init__(self) -> None:
+    def __init__(self, opt: ModelOpt) -> None:
         super().__init__()
 
-        self.opt = get_opt()
+        self.opt = opt
 
         seed_everything(self.opt.seed)
 
@@ -111,14 +114,14 @@ class Text2Image:
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.model = self.model.to(self.device)
 
-    def main(self):
-
         if self.opt.dpm_solver:
             self.sampler = DPMSolverSampler(self.model)
         elif self.opt.plms:
             self.sampler = PLMSSampler(self.model)
         else:
             self.sampler = DDIMSampler(self.model)
+
+    def main(self, req: Text2ImageRequest):
 
         os.makedirs(self.opt.outdir, exist_ok=True)
         outpath = self.opt.outdir
@@ -130,16 +133,7 @@ class Text2Image:
 
         batch_size = self.opt.n_samples
         n_rows = self.opt.n_rows if self.opt.n_rows > 0 else batch_size
-        if not self.opt.from_file:
-            prompt = self.opt.prompt
-            assert prompt is not None
-            data = [batch_size * [prompt]]
-
-        else:
-            print(f"reading prompts from {self.opt.from_file}")
-            with open(self.opt.from_file, "r") as f:
-                data = f.read().splitlines()
-                data = list(chunk(data, batch_size))
+        data = [batch_size * [req.prompt]]
 
         sample_path = os.path.join(outpath, "samples")
         os.makedirs(sample_path, exist_ok=True)
@@ -194,18 +188,18 @@ class Text2Image:
                             if not self.opt.skip_grid:
                                 all_samples.append(x_checked_image_torch)
 
-                    if not self.opt.skip_grid:
-                        # additionally, save as grid
-                        grid = torch.stack(all_samples, 0)
-                        grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                        grid = make_grid(grid, nrow=n_rows)
-
-                        # to image
-                        grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                        img = Image.fromarray(grid.astype(np.uint8))
-                        # img = put_watermark(img, wm_encoder)
-                        img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-                        grid_count += 1
+                    # if not self.opt.skip_grid:
+                    #     # additionally, save as grid
+                    #     grid = torch.stack(all_samples, 0)
+                    #     grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+                    #     grid = make_grid(grid, nrow=n_rows)
+                    #
+                    #     # to image
+                    #     grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+                    #     img = Image.fromarray(grid.astype(np.uint8))
+                    #     # img = put_watermark(img, wm_encoder)
+                    #     img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+                    #     grid_count += 1
 
                     toc = time.time()
 
@@ -214,7 +208,9 @@ class Text2Image:
 
 
 if __name__ == "__main__":
-    text2Image = Text2Image()
+    text2Image = Text2Image(ModelOpt(plms=True, ckpt='../../sd-v1-4.ckpt', skip_grid=True, n_samples=1))
+
+    text2Image.main(Text2ImageRequest(requestId=str(uuid), requestedAt="", prompt="Bulldog"))
 
 # python scripts/txt2img.py --prompt "greg manchess portrait painting of armored bobba fett as overwatch character, medium shot, asymmetrical, profile picture, organic painting, sunny day, matte painting, bold shapes, hard edges, street art, trending on artstation, by huang guangjian and gil elvgren and sachin teng" --plms --ckpt sd-v1-4.ckpt --skip_grid --n_samples 1
 # python scripts/sd/txt_2_img.py --prompt "greg manchess portrait painting of armored bobba fett as overwatch character, medium shot, asymmetrical, profile picture, organic painting, sunny day, matte painting, bold shapes, hard edges, street art, trending on artstation, by huang guangjian and gil elvgren and sachin teng" --plms --ckpt sd-v1-4.ckpt --skip_grid --n_samples 1
